@@ -33,11 +33,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cassert>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <climits>
 #include <mutex>
 #include <regex>
 #include <string>
@@ -76,9 +78,19 @@
 
 // TODO: use defined(_POSIX_VERSION) for some of these things?
 
+#ifndef LOGURU_USE_LOCALE
+	#define LOGURU_USE_LOCALE 0
+#endif
+
 #if defined(_WIN32) || defined(__CYGWIN__)
 	#define LOGURU_PTHREADS    0
 	#define LOGURU_WINTHREADS  1
+	#ifndef LOGURU_STACKTRACES
+		#define LOGURU_STACKTRACES 0
+	#endif
+#elif defined(__rtems__) || defined(__ANDROID__) || defined(__FreeBSD__)
+	#define LOGURU_PTHREADS    1
+	#define LOGURU_WINTHREADS  0
 	#ifndef LOGURU_STACKTRACES
 		#define LOGURU_STACKTRACES 0
 	#endif
@@ -103,6 +115,9 @@
 #endif // LOGURU_STACKTRACES
 
 #if LOGURU_PTHREADS
+	// for std::is_pointer<> to differentiate pthread_self() type variations
+	#include <type_traits>
+
 	#include <pthread.h>
 	#if defined(__FreeBSD__)
 		#include <pthread_np.h>
@@ -127,7 +142,9 @@
 		#define _WIN32_WINNT 0x0502
 	#endif
 	#define WIN32_LEAN_AND_MEAN
-	#define NOMINMAX
+	#ifndef NOMINMAX
+		#define NOMINMAX
+	#endif
 	#include <windows.h>
 #endif
 
@@ -420,18 +437,27 @@ namespace loguru
 	LOGURU_PRINTF_LIKE(1, 0)
 	static Text vtextprintf(const char* format, va_list vlist)
 	{
-#ifdef _WIN32
-		int bytes_needed = _vscprintf(format, vlist);
+		// Determine the required length of the string
+		int bytes_needed = 0;
+
+		// Calling vsnprintf is assumed to 'consume' the vlist, therefore we need a copy
+		// of the args to avoid corrupting the stack in the second call to vsnprintf.
+		va_list argcopy;
+		va_copy(argcopy, vlist);
+		bytes_needed = vsnprintf(NULL, 0, format, argcopy);
+		va_end(argcopy);
 		CHECK_F(bytes_needed >= 0, "Bad string format: '%s'", format);
-		char* buff = (char*)malloc(bytes_needed+1);
-		vsnprintf(buff, bytes_needed+1, format, vlist);
+
+		// Allocate the string's buffer
+		++bytes_needed; // Add space for null terminator
+		auto buff = static_cast<char*>(malloc(bytes_needed));
+		CHECK_F(buff != nullptr, "Out of memory");
+
+		// Construct the string and check the result
+		const auto written = vsnprintf(buff, bytes_needed, format, vlist);
+		CHECK_F(written <= bytes_needed, "Bad string format: '%s'", format);
+
 		return Text(buff);
-#else
-		char* buff = nullptr;
-		int result = vasprintf(&buff, format, vlist);
-		CHECK_F(result >= 0, "Bad string format: '" LOGURU_FMT(s) "'", format);
-		return Text(buff);
-#endif
 	}
 
 	Text textprintf(const char* format, ...)
@@ -479,10 +505,10 @@ namespace loguru
 				last_is_alpha = std::isalpha(cmd[arg_len], std::locale(""));
 			}
 			catch (...) {
-				last_is_alpha = std::isalpha(static_cast<int>(cmd[arg_len]));
+				last_is_alpha = std::isalpha(cmd[arg_len]);
 			}
 			#else
-			last_is_alpha = std::isalpha(static_cast<int>(cmd[arg_len]));
+			last_is_alpha = std::isalpha(cmd[arg_len]);
 			#endif
 
 			if (strncmp(cmd, verbosity_flag, arg_len) == 0 && !last_is_alpha) {
@@ -491,7 +517,7 @@ namespace loguru
 				if (value_str[0] == '\0') {
 					// Value in separate argument
 					arg_it += 1;
-					CHECK_LT_F(arg_it, argc, "Missing verbosiy level after " LOGURU_FMT(s) "", verbosity_flag);
+					CHECK_LT_F(arg_it, argc, "Missing verbosity level after " LOGURU_FMT(s) "", verbosity_flag);
 					value_str = argv[arg_it];
 					out_argc -= 1;
 				}
@@ -568,7 +594,11 @@ namespace loguru
 			else if (c == '\'') { out += "\\\'"; }
 			else if (c == '\"') { out += "\\\""; }
 			else if (c == ' ')  { out += "\\ ";  }
-			else if (0 <= c && c < 0x20) { // ASCI control character:
+#if (CHAR_MIN < 0) // char is signed
+			else if (0 <= c && c < 0x20) { // ASCI control character
+#else // char is unsigned
+			else if (c < 0x20) { // ASCI control character
+#endif
 			// else if (c < 0x20 || c != (c & 127)) { // ASCII control character or UTF-8:
 				out += "\\x";
 				write_hex_byte(out, static_cast<uint8_t>(c));
@@ -591,6 +621,7 @@ namespace loguru
 		return Text(STRDUP(buff));
 	#else
 		// Not thread-safe.
+		(void)buff; // unused parameter
 		return Text(STRDUP(strerror(errno)));
 	#endif
 	}
@@ -611,7 +642,7 @@ namespace loguru
 			LOG_F(WARNING, "Failed to get current working directory: " LOGURU_FMT(s) "", error_text.c_str());
 		}
 
-		s_arguments = "";
+		s_arguments.clear();
 		for (int i = 0; i < argc; ++i) {
 			escape(s_arguments, argv[i]);
 			if (i + 1 < argc) {
@@ -639,6 +670,9 @@ namespace loguru
 						pthread_set_name_np(this_thread, main_thread_name);
 					#elif defined(__linux__) || defined(__sun)
 						pthread_setname_np(this_thread, main_thread_name);
+					#else
+						// platforms that we don't know how to set the name on
+						(void)this_thread; // unused
 					#endif
 				}
 			#endif // LOGURU_PTHREADS
@@ -657,7 +691,7 @@ namespace loguru
 			fflush(stderr);
 		}
 		VLOG_F(g_internal_verbosity, "arguments: " LOGURU_FMT(s) "", s_arguments.c_str());
-		if (strlen(s_current_dir) != 0)
+		if (s_current_dir[0] != '\0')
 		{
 			VLOG_F(g_internal_verbosity, "Current dir: " LOGURU_FMT(s) "", s_current_dir);
 		}
@@ -759,6 +793,7 @@ namespace loguru
 	{
 		CHECK_F(file_path_const && *file_path_const);
 		char* file_path = STRDUP(file_path_const);
+		CHECK_F(file_path != nullptr, "Failed to allocate memory");
 		for (char* p = strchr(file_path + 1, '/'); p; p = strchr(p + 1, '/')) {
 			*p = '\0';
 
@@ -827,7 +862,7 @@ namespace loguru
 		if (!s_arguments.empty()) {
 			fprintf(file, "arguments: %s\n", s_arguments.c_str());
 		}
-		if (strlen(s_current_dir) != 0) {
+		if (s_current_dir[0] != '\0') {
 			fprintf(file, "Current dir: %s\n", s_current_dir);
 		}
 		fprintf(file, "File verbosity level: %d\n", verbosity);
@@ -908,7 +943,7 @@ namespace loguru
 			return;
 		}
 
-		s_user_stack_cleanups.push_back(StringPair(find_this, replace_with_this));
+		s_user_stack_cleanups.emplace_back(StringPair(find_this, replace_with_this));
 	}
 
 	static void on_callback_change()
@@ -1034,7 +1069,7 @@ namespace loguru
 	// Where we store the custom thread name set by `set_thread_name`
 	char* thread_name_buffer()
 	{
-		__declspec( thread ) static char thread_name[LOGURU_THREADNAME_WIDTH + 1] = {0};
+		static char thread_name[LOGURU_THREADNAME_WIDTH + 1] = {0};
 		return &thread_name[0];
 	}
 #endif // LOGURU_WINTHREADS
@@ -1053,6 +1088,9 @@ namespace loguru
 				pthread_set_name_np(pthread_self(), name);
 			#elif defined(__linux__) || defined(__sun)
 				pthread_setname_np(pthread_self(), name);
+			#else
+				// Platforms that may not support setting a thread name
+				(void)name; // unused
 			#endif
 		#elif LOGURU_WINTHREADS
 			// Store thread name in a thread-local storage:
@@ -1080,7 +1118,13 @@ namespace loguru
 			// Ask the OS about the thread name.
 			// This is what we *want* to do on all platforms, but
 			// only some platforms support it (currently).
-			pthread_getname_np(pthread_self(), buffer, length);
+
+			#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__linux__) || defined(__sun)
+				pthread_getname_np(pthread_self(), buffer, length);
+			#else
+				// Other platforms that don't support thread names
+				buffer[0] = 0;
+			#endif
 		#elif LOGURU_WINTHREADS
 			snprintf(buffer, static_cast<size_t>(length), "%s", thread_name_buffer());
 		#else
@@ -1101,7 +1145,15 @@ namespace loguru
 				long thread_id;
 				(void)thr_self(&thread_id);
 			#elif LOGURU_PTHREADS
-				uint64_t thread_id = pthread_self();
+				const auto native_id = pthread_self();
+				// Warning, even within POSIX, return types and sizes vary:
+				//  - Haku GCC returns a pthread_t*
+				//  - ARM32 GCC returns an unsigned long long int
+				// So we bake the variations down to a common integer:
+				const auto pthread_self_is_pointer = std::is_pointer<decltype(native_id)>::value;
+				const auto thread_id = pthread_self_is_pointer
+				                           ? reinterpret_cast<uintptr_t>((void*)native_id)
+				                           : static_cast<uintptr_t>(native_id);
 			#else
 				// This ID does not correllate to anything we can get from the OS,
 				// so this is the worst way to get the ID.
@@ -1173,7 +1225,7 @@ namespace loguru
 
 		try {
 			std::regex std_allocator_re(R"(,\s*std::allocator<[^<>]+>)");
-			output = std::regex_replace(output, std_allocator_re, std::string(""));
+			output = std::regex_replace(output, std_allocator_re, std::string());
 
 			std::regex template_spaces_re(R"(<\s*([^<> ]+)\s*>)");
 			output = std::regex_replace(output, template_spaces_re, std::string("<$1>"));
@@ -1206,8 +1258,7 @@ namespace loguru
 				}
 				snprintf(buf, sizeof(buf), "%-3d %*p %s + %zd\n",
 						 i - skip, int(2 + sizeof(void*) * 2), callstack[i],
-						 status == 0 ? demangled :
-						 info.dli_sname == 0 ? symbols[i] : info.dli_sname,
+						 status == 0 ? demangled : info.dli_sname,
 						 static_cast<char*>(callstack[i]) - static_cast<char*>(info.dli_saddr));
 				free(demangled);
 			} else {
@@ -1256,7 +1307,9 @@ namespace loguru
 		if (out_buff_size == 0) { return; }
 		out_buff[0] = '\0';
 		size_t pos = 0;
-		if (g_preamble_date && pos < out_buff_size) {
+
+		assert(pos < out_buff_size);
+		if (g_preamble_date) {
 			int bytes = snprintf(out_buff + pos, out_buff_size - pos, "date       ");
 			if (bytes > 0) {
 				pos += bytes;
@@ -1293,10 +1346,14 @@ namespace loguru
 			}
 		}
 		if (g_preamble_pipe && pos < out_buff_size) {
-			int bytes = snprintf(out_buff + pos, out_buff_size - pos, "| ");
-			if (bytes > 0) {
-				pos += bytes;
-			}
+			(void)snprintf(out_buff + pos, out_buff_size - pos, "| ");
+
+			// Because this is the last if-statement, we avoid incrementing the
+			//  position to clarify it's unused. If more cases are added, then:
+			// int bytes = snprintf(...)
+			// if (bytes > 0) {
+			// 	pos += bytes;
+			// }
 		}
 	}
 
@@ -1320,7 +1377,7 @@ namespace loguru
 			file = filename(file);
 		}
 
-		char level_buff[6];
+		char level_buff[7];
 		const char* custom_level_name = get_verbosity_name(verbosity);
 		if (custom_level_name) {
 			snprintf(level_buff, sizeof(level_buff) - 1, "%s", custom_level_name);
@@ -1330,7 +1387,8 @@ namespace loguru
 
 		size_t pos = 0;
 
-		if (g_preamble_date && pos < out_buff_size) {
+		assert(pos < out_buff_size);
+		if (g_preamble_date) {
 			int bytes = snprintf(out_buff + pos, out_buff_size - pos, "%04d-%02d-%02d ",
 				                 1900 + time_info.tm_year, 1 + time_info.tm_mon, time_info.tm_mday);
 			if (bytes > 0) {
@@ -1375,10 +1433,13 @@ namespace loguru
 			}
 		}
 		if (g_preamble_pipe && pos < out_buff_size) {
-			int bytes = snprintf(out_buff + pos, out_buff_size - pos, "| ");
-			if (bytes > 0) {
-				pos += bytes;
-			}
+			(void)snprintf(out_buff + pos, out_buff_size - pos, "| ");
+
+			// Avoid incrementing the position to clarify it's unused
+			// int bytes = snprintf(...)
+			// if (bytes > 0) {
+			// 	pos += bytes;
+			// }
 		}
 	}
 
@@ -1698,7 +1759,7 @@ namespace loguru
 
 	struct StringStream
 	{
-		std::string str;
+		std::string str{};
 	};
 
 	// Use this in your EcPrinter implementations.
@@ -1842,7 +1903,11 @@ namespace loguru
 		else if (c == '\n') { str += "\\n";  }
 		else if (c == '\r') { str += "\\r";  }
 		else if (c == '\t') { str += "\\t";  }
+#if (CHAR_MIN < 0) // char is signed
 		else if (0 <= c && c < 0x20) {
+#else // char is unsigned
+		else if (c < 0x20) {
+#endif
 			str += "\\u";
 			write_hex_16(static_cast<uint16_t>(c));
 		} else { str += c; }
@@ -1876,6 +1941,7 @@ namespace loguru
 		Text parent_ec = get_error_context_for(ec_handle);
 		size_t buffer_size = strlen(parent_ec.c_str()) + 2;
 		char* with_newline = reinterpret_cast<char*>(malloc(buffer_size));
+		CHECK_F(with_newline != nullptr, "Failed to allocate memory for error context.");
 		with_newline[0] = '\n';
 	#ifdef _WIN32
 		strncpy_s(with_newline + 1, buffer_size, parent_ec.c_str(), buffer_size - 2);
@@ -1926,7 +1992,10 @@ namespace loguru
 		memset(&sig_action, 0, sizeof(sig_action));
 		sigemptyset(&sig_action.sa_mask);
 		sig_action.sa_handler = SIG_DFL;
-		sigaction(signal_number, &sig_action, NULL);
+
+		// Note: Explicitly ignore sigaction's return value.
+		//       It's only used when setting up the signal handlers.
+		(void) sigaction(signal_number, &sig_action, NULL);
 		kill(getpid(), signal_number);
 	}
 
